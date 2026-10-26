@@ -30,7 +30,7 @@ from ai.mock import MOCK_MODEL_NAME, mock_model_reply
 from ai.nebius_client import AIIntegrationError, NebiusClient
 from ai.patch_review import SECRET_KEY_RE, _instructions, review_patch
 from ai.prompts import SYSTEM_PROMPT, build_user_prompt
-from ai.response_parser import parse_model_response
+from ai.response_parser import _extract_json_object, parse_model_response
 
 
 def _unified_diff(original: str, patched: str) -> str:
@@ -143,6 +143,20 @@ def _secret_values(dockerfile_text: Any) -> set[str]:
     return values
 
 
+def _full_patch_text(raw: Any) -> str:
+    """patch.patched_dockerfile from the model reply exactly as sent (before any length
+    limit), found the same way the parser finds the JSON object. "" if absent or invalid."""
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    try:
+        data = _extract_json_object(raw)
+    except ValueError:
+        return ""
+    patch = data.get("patch") if isinstance(data, dict) else None
+    value = patch.get("patched_dockerfile") if isinstance(patch, dict) else None
+    return value if isinstance(value, str) else ""
+
+
 def _redact(value: Any, secrets: list[str]) -> Any:
     """Return a copy with every secret replaced in all strings (dict keys included). Types are preserved."""
     if isinstance(value, str):
@@ -167,12 +181,65 @@ def analyze_evidence(
     on failure returns status "ai_error" with ai.error = {code, message}.
     Secret values from the Dockerfile and proposed patch are redacted from the whole result.
     """
-    result = _analyze_unredacted(dockerfile_text, attack_logs, settings, client)
-    secrets = _secret_values(dockerfile_text) | _secret_values(result["patch"]["patched_dockerfile"])
+    used_for_cuts: set[str] = set()
+    result = _analyze_unredacted(dockerfile_text, attack_logs, settings, client, used_for_cuts)
+    # Redact every value the parser protected, even one whose defining line was later cut away.
+    secrets = (_secret_values(dockerfile_text) | _secret_values(result["patch"]["patched_dockerfile"])
+               | used_for_cuts)
     if not secrets:
         return result
     # Longest first, so a secret that contains another secret is fully replaced.
-    return _redact(result, sorted(secrets, key=len, reverse=True))
+    ordered = sorted(secrets, key=len, reverse=True)
+    _keep_ids_unique_after_redaction(result, ordered)
+    return _redact(result, ordered)
+
+
+def _keep_ids_unique_after_redaction(result: dict[str, Any], secrets: list[str]) -> None:
+    """
+    Redaction could turn two different finding ids into the same text (for example
+    two ids that both contain a secret value). Before redacting, rename the later
+    finding to a free "F-NNN" that redaction leaves unchanged, and update every place
+    that refers to it (evidence keys, correlation references, review messages).
+    Ids are unique before this step, so each reference is remapped exactly; nothing
+    is guessed. Modifies `result` in place.
+    """
+    findings = result["findings"]
+    if len(findings) < 2:
+        return
+    final_ids = {f["id"]: _redact(f["id"], secrets) for f in findings}
+    reserved = set(final_ids) | set(final_ids.values())
+    seen: set[str] = set()
+    renames: dict[str, str] = {}
+    number = 1
+    for finding in findings:
+        final = final_ids[finding["id"]]
+        if final not in seen:
+            seen.add(final)
+            continue
+        while (f"F-{number:03d}" in reserved
+               or _redact(f"F-{number:03d}", secrets) != f"F-{number:03d}"):
+            number += 1
+        new_id = f"F-{number:03d}"
+        reserved.add(new_id)
+        seen.add(new_id)
+        renames[finding["id"]] = new_id
+    if not renames:
+        return
+
+    for finding in findings:
+        finding["id"] = renames.get(finding["id"], finding["id"])
+    ai = result["ai"]
+    ai["finding_evidence"] = {renames.get(k, k): v for k, v in ai["finding_evidence"].items()}
+    for corr in result["correlations"]:
+        corr["related_finding_ids"] = [renames.get(i, i) for i in corr["related_finding_ids"]]
+    for issue in ai.get("patch_review", {}).get("issues", []):
+        for old, new in renames.items():
+            if issue["message"].startswith(f"{old} ("):  # unresolved_finding messages start with the id
+                issue["message"] = new + issue["message"][len(old):]
+    for new_id in renames.values():
+        ai["warnings"].append(
+            f"A finding id would have matched another id after secret redaction; it was renamed to '{new_id}'."
+        )
 
 
 def _analyze_unredacted(
@@ -180,7 +247,9 @@ def _analyze_unredacted(
     attack_logs: Optional[Any] = None,
     settings: Optional[Settings] = None,
     client: Optional[NebiusClient] = None,
+    secrets_out: Optional[set] = None,
 ) -> dict[str, Any]:
+    """Analysis without redaction. Adds the secret values used for safe cuts to `secrets_out`."""
     settings = settings or get_settings()
     source = "mock" if settings.mode == "mock" else "nebius"
     model = MOCK_MODEL_NAME if source == "mock" else settings.model
@@ -202,8 +271,22 @@ def _analyze_unredacted(
             reply = (client or NebiusClient(settings)).chat(
                 SYSTEM_PROMPT, build_user_prompt(dockerfile_text, attack_logs)
             )
+            # NebiusClient already rejects cut-off replies; this also covers injected clients.
+            if reply.get("finish_reason") == "length":
+                return fail("invalid_response", "Model output was cut off (max tokens); response rejected.")
             raw, model, usage = reply["content"], reply["model"], reply["usage"]
-        parsed = parse_model_response(raw)
+        # Length limits must never split a secret (a partial value would escape redaction).
+        # Secrets come from the uploaded Dockerfile and from the FULL proposed patch, read
+        # before any length limit: a cut patch line would only reveal a prefix of the value.
+        sensitive = _secret_values(dockerfile_text) | _secret_values(_full_patch_text(raw))
+        parsed = parse_model_response(raw, sensitive)
+        # Safety net; with the full patch already scanned this should find nothing new.
+        patch_secrets = _secret_values(parsed["patch"]["patched_dockerfile"]) - sensitive
+        if patch_secrets:
+            sensitive |= patch_secrets
+            parsed = parse_model_response(raw, sensitive)
+        if secrets_out is not None:
+            secrets_out |= sensitive
     except AIIntegrationError as exc:
         return fail(exc.code, str(exc))
     except ValueError as exc:
@@ -243,8 +326,12 @@ def _analyze_unredacted(
         patch_status=patch_status,
         patch_review=review,
     )
-    if usage:
-        result["ai"]["usage"] = {
-            k: usage[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens") if k in usage
-        }
+    # Token counts come from Nebius (untrusted): keep only non-negative integers.
+    counts = {}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = usage.get(key) if isinstance(usage, dict) else None
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            counts[key] = value
+    if counts:
+        result["ai"]["usage"] = counts
     return result

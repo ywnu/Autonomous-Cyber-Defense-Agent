@@ -12,13 +12,18 @@ The model only produces the AI-owned parts of the team contract
 
 import json
 import re
-from typing import Any, Optional
+from collections import Counter
+from contextvars import ContextVar
+from typing import Any, Iterable, Optional
 
 SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
 SEVERITY_ALIASES = {"MODERATE": "MEDIUM", "INFORMATIONAL": "INFO", "NONE": "INFO", "WARNING": "MEDIUM"}
 MAX_FINDINGS = 50
 MAX_TEXT = 4_000
 MAX_PATCH = 100_000
+ID_LIMIT = 20       # length of public finding ids (agreed format)
+RAW_ID_LIMIT = 200  # model ids/references are matched on their full text up to this length
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 # Team-agreed public schema (exact keys).
 FINDING_FIELDS = ("id", "title", "severity", "description", "recommendation")
@@ -51,6 +56,31 @@ def _extract_json_object(raw: str) -> Any:
     raise ValueError("Model response is not valid JSON.")
 
 
+# Secret values for the parse in progress (set by parse_model_response). Used only to
+# choose safe cut points; the parser never redacts (ai.service does, at the end).
+_SENSITIVE: ContextVar[tuple[str, ...]] = ContextVar("_SENSITIVE", default=())
+
+
+def _cut(text: str, limit: int) -> str:
+    """
+    text[:limit], except that the cut never lands inside a sensitive value: if it
+    would, cut just before that value. Otherwise final redaction would miss the
+    remaining prefix (it only matches whole values).
+    """
+    if len(text) <= limit:
+        return text
+    end = limit
+    moved = True
+    while moved:
+        moved = False
+        for value in _SENSITIVE.get():
+            for start in range(max(0, end - len(value) + 1), end):
+                if text.startswith(value, start):  # occurrence crosses the cut
+                    end, moved = start, True
+                    break
+    return text[:end]
+
+
 def _text(value: Any, limit: int = MAX_TEXT) -> str:
     if value is None:
         return ""
@@ -58,7 +88,7 @@ def _text(value: Any, limit: int = MAX_TEXT) -> str:
         value = "\n".join(str(v) for v in value)
     elif not isinstance(value, str):
         value = str(value)
-    return value.strip()[:limit]
+    return _cut(value.strip(), limit)
 
 
 def _severity(value: Any) -> str:
@@ -80,21 +110,106 @@ def _optional_text(value: Any, limit: int = 100) -> Optional[str]:
     return text if text and text.lower() not in ("null", "none", "unknown", "n/a") else None
 
 
-def _parse_findings(items: Any, warnings: list[str]) -> tuple[list[dict], dict[str, str]]:
-    """Return (findings in the agreed schema, {finding_id: quoted evidence})."""
+def _raw_id(value: Any) -> Optional[str]:
+    """
+    Full model-provided id used for matching, or None if unusable.
+    Accepts strings and integers only; lists, objects, floats and booleans are not
+    turned into ids. Ids with control characters or over RAW_ID_LIMIT are unusable.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        value = str(value)
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or len(value) > RAW_ID_LIMIT or _CONTROL_RE.search(value):
+        return None
+    return value
+
+
+def _short(raw: str) -> str:
+    return raw if len(raw) <= 40 else _cut(raw, 40) + "..."
+
+
+def _parse_findings(items: Any, warnings: list[str]) -> tuple[list[dict], dict[str, str], dict]:
+    """
+    Return (findings in the agreed schema, {finding_id: quoted evidence}, ref_index).
+
+    Public ids are at most ID_LIMIT characters and unique:
+    - A usable model id keeps its first ID_LIMIT characters as the public id.
+    - All public forms of model ids are reserved first; a missing, unusable or
+      already-used id gets the next free "F-NNN".
+
+    ref_index tells _parse_correlations how to resolve references, using the FULL
+    model id (never the shortened one):
+      "resolve":   {full id: public id} for ids that identify exactly one retained finding
+      "ambiguous": full ids given more than once, or whose public form collides
+                   with another retained id (cut to ID_LIMIT), or that are shared
+                   with a dropped/capped finding
+      "unretained": full ids of findings that were malformed or beyond MAX_FINDINGS
+    """
+    empty_index = {"resolve": {}, "ambiguous": set(), "unretained": set()}
     if not isinstance(items, list):
         warnings.append("'findings' was not a list; treated as empty.")
-        return [], {}
-    findings: list[dict] = []
-    evidence: dict[str, str] = {}
-    for index, item in enumerate(items[:MAX_FINDINGS]):
+        return [], {}, empty_index
+
+    valid = []  # (index, item, title, full model id or None)
+    unretained: set[str] = set()
+    for index, item in enumerate(items):
+        raw = _raw_id(item.get("id")) if isinstance(item, dict) else None
+        if index >= MAX_FINDINGS:
+            if raw:
+                unretained.add(raw)
+            continue
         # "issue" is the pre-agreement name for "title"; accept both.
         title = _text(item.get("title") or item.get("issue"), 300) if isinstance(item, dict) else ""
         if not title:
             warnings.append(f"Dropped malformed finding at index {index}.")
+            if raw:
+                unretained.add(raw)
             continue
+        if raw is None and item.get("id") not in (None, ""):
+            warnings.append(f"Finding at index {index} has an unusable id (not a short single-line "
+                            f"string or integer); a new id was assigned.")
+        valid.append((index, item, title, raw))
+
+    raw_counts = Counter(raw for *_, raw in valid if raw)
+    # Public form: first ID_LIMIT chars, cut before any secret (may be "" if the id starts with one).
+    public_of = {raw: _cut(raw, ID_LIMIT) for raw in raw_counts}
+    public_forms: dict[str, set[str]] = {}
+    for raw, public in public_of.items():
+        if public:
+            public_forms.setdefault(public, set()).add(raw)
+    ambiguous = {
+        raw for raw, count in raw_counts.items()
+        if count > 1 or len(public_forms.get(public_of[raw], ())) > 1 or raw in unretained
+    }
+    taken = set(public_forms)  # reserve every model id's public form before generating replacements
+
+    findings: list[dict] = []
+    evidence: dict[str, str] = {}
+    resolve: dict[str, str] = {}
+    assigned: set[str] = set()
+    next_number = 1
+    for index, item, title, raw in valid:
+        finding_id = public_of[raw] if raw else ""
+        if not finding_id or finding_id in assigned:
+            while f"F-{next_number:03d}" in taken:
+                next_number += 1
+            new_id = f"F-{next_number:03d}"
+            taken.add(new_id)
+            if finding_id:
+                warnings.append(f"Finding at index {index}: id '{_short(raw)}' is already used, or matches "
+                                f"another id in its first {ID_LIMIT} characters; renamed to '{new_id}'.")
+            elif raw:
+                warnings.append(f"Finding at index {index}: id could not be shortened safely; renamed to '{new_id}'.")
+            finding_id = new_id
+        if raw and raw not in ambiguous:
+            resolve[raw] = finding_id  # the full id identifies exactly this finding
+        assigned.add(finding_id)
         finding = {
-            "id": _text(item.get("id"), 20) or f"F-{len(findings) + 1:03d}",
+            "id": finding_id,
             "title": title,
             "severity": _severity(item.get("severity")),
             "description": _text(item.get("description")),
@@ -106,11 +221,19 @@ def _parse_findings(items: Any, warnings: list[str]) -> tuple[list[dict], dict[s
         findings.append(finding)
     if len(items) > MAX_FINDINGS:
         warnings.append(f"Only the first {MAX_FINDINGS} findings were kept.")
-    return findings, evidence
+    return findings, evidence, {"resolve": resolve, "ambiguous": ambiguous, "unretained": unretained}
 
 
-def _parse_correlations(items: Any, warnings: list[str]) -> list[dict]:
-    """Structure only. Grounding of event_type/source_ip against the logs is done in ai.service."""
+def _parse_correlations(items: Any, warnings: list[str], ref_index: dict) -> list[dict]:
+    """
+    Structure, plus finding references. A reference is kept only if its FULL text
+    matches exactly one retained finding's model id (see _parse_findings); it is then
+    replaced by that finding's public id. References to duplicated, colliding,
+    dropped, capped, unknown or parser-generated ids are dropped with a warning
+    instead of guessing which finding was meant.
+    Grounding of event_type/source_ip against the logs is done in ai.service.
+    """
+    resolve, ambiguous_ids, unretained = ref_index["resolve"], ref_index["ambiguous"], ref_index["unretained"]
     if items is None:
         return []
     if not isinstance(items, list):
@@ -125,10 +248,25 @@ def _parse_correlations(items: Any, warnings: list[str]) -> list[dict]:
         ids = item.get("related_finding_ids", item.get("finding_ids", []))
         if isinstance(ids, str):
             ids = [ids]
+        refs = [_raw_id(f) for f in ids] if isinstance(ids, list) else []
+        ambiguous = sorted({_short(r) for r in refs if r in ambiguous_ids})
+        if ambiguous:
+            warnings.append(f"Correlation at index {index}: dropped reference(s) to duplicated finding id(s) "
+                            f"{ambiguous}; the intended finding is unclear.")
+        if any(r in unretained and r not in ambiguous_ids for r in refs):
+            warnings.append(f"Correlation at index {index}: dropped reference(s) to findings that were "
+                            f"malformed or beyond the first {MAX_FINDINGS}.")
+        if any(r is None or (r not in resolve and r not in ambiguous_ids and r not in unretained) for r in refs):
+            warnings.append(f"Correlation at index {index}: dropped reference(s) to unknown finding ids.")
+        related = []
+        for ref in refs:
+            public = resolve.get(ref) if ref else None
+            if public and public not in related:
+                related.append(public)
         result.append({
             "event_type": _optional_text(item.get("event_type")),
             "source_ip": _optional_text(item.get("source_ip"), 64),
-            "related_finding_ids": [_text(f, 20) for f in ids if _text(f, 20)] if isinstance(ids, list) else [],
+            "related_finding_ids": related,
             "explanation": _text(item.get("explanation")),
         })
     return result
@@ -147,17 +285,28 @@ def _parse_patch(value: Any, warnings: list[str]) -> dict:
         if raw is not None and not isinstance(raw, str):
             warnings.append(f"'patch.{field}' was not a string; treated as empty.")
             raw = ""
-        patch[field] = (raw or "").strip()[:limit] if field == "summary" else (raw or "")[:limit]
+        patch[field] = _cut((raw or "").strip(), limit) if field == "summary" else _cut(raw or "", limit)
     return patch
 
 
-def parse_model_response(raw_response: str) -> dict[str, Any]:
+def parse_model_response(raw_response: str, sensitive: Iterable[str] = ()) -> dict[str, Any]:
     """
     Return the validated AI portion:
     {findings, finding_evidence, correlations, patch, summary, limitations, next_steps, warnings}
     Raises ValueError if the response is empty, not JSON, or not a JSON object
     with a 'findings' field.
+
+    `sensitive`: secret values that must never be split by a length limit (fields are
+    cut before them instead). They are NOT redacted here; the caller redacts the result.
     """
+    token = _SENSITIVE.set(tuple(v for v in set(sensitive) if v))
+    try:
+        return _parse(raw_response)
+    finally:
+        _SENSITIVE.reset(token)
+
+
+def _parse(raw_response: str) -> dict[str, Any]:
     if not isinstance(raw_response, str) or not raw_response.strip():
         raise ValueError("Model response is empty.")
 
@@ -168,11 +317,11 @@ def parse_model_response(raw_response: str) -> dict[str, Any]:
         raise ValueError("Model response is missing fields: ['findings']")
 
     warnings: list[str] = []
-    findings, evidence = _parse_findings(data.get("findings"), warnings)
+    findings, evidence, ref_index = _parse_findings(data.get("findings"), warnings)
     return {
         "findings": findings,
         "finding_evidence": evidence,
-        "correlations": _parse_correlations(data.get("correlations"), warnings),
+        "correlations": _parse_correlations(data.get("correlations"), warnings, ref_index),
         "patch": _parse_patch(data.get("patch"), warnings),
         "summary": _text(data.get("summary"), 1_000),
         "limitations": _str_list(data.get("limitations")),

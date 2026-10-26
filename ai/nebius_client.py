@@ -172,13 +172,17 @@ class NebiusClient:
                 "invalid_response", "Nebius returned an unexpected response structure."
             ) from None
 
+        # A cut-off reply is rejected even if it contains parseable JSON: the JSON may be
+        # an incomplete answer or an example from the model's reasoning. Not retried.
+        if choice.get("finish_reason") == "length":
+            raise AIIntegrationError(
+                "invalid_response",
+                "Model output was cut off (max tokens); response rejected. "
+                "Increase NEBIUS_MAX_OUTPUT_TOKENS.",
+            )
+
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, str) or not content.strip():
-            if choice.get("finish_reason") == "length":
-                raise AIIntegrationError(
-                    "invalid_response",
-                    "Model output was cut off (max tokens). Increase NEBIUS_MAX_OUTPUT_TOKENS.",
-                )
             refusal = message.get("refusal") if isinstance(message, dict) else None
             raise AIIntegrationError(
                 "invalid_response",

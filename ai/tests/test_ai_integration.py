@@ -266,9 +266,63 @@ def assert_contract(result):
         assert c["source_ip"] is None or isinstance(c["source_ip"], str)
         assert isinstance(c["explanation"], str) and c["explanation"]
         assert set(c["related_finding_ids"]) <= finding_ids
+    assert len(finding_ids) == len(result["findings"]), "finding ids must be unique"
+    assert result["status"] in ("completed", "ai_error")
+    assert_ai_metadata(result, finding_ids)
 
 
-MOCK = dataclasses.replace(SETTINGS, mode="mock", api_key="")
+AI_REQUIRED = {"source", "model", "summary", "limitations", "next_steps", "warnings",
+               "finding_evidence", "patch_status", "error"}
+AI_OPTIONAL = {"patch_review", "usage"}
+USAGE_KEYS = {"prompt_tokens", "completion_tokens", "total_tokens"}
+
+
+def is_str_list(value):
+    return isinstance(value, list) and all(isinstance(v, str) for v in value)
+
+
+def assert_ai_metadata(result, finding_ids):
+    """Types and consistency of the additive `ai` object (contracts/api_contract.md, `ai` object)."""
+    ai = result["ai"]
+    assert isinstance(ai, dict)
+    assert AI_REQUIRED <= set(ai) <= AI_REQUIRED | AI_OPTIONAL, sorted(set(ai) ^ AI_REQUIRED)
+    assert ai["source"] in ("nebius", "mock")  # "unknown" is only used by the backend crash fallback
+    assert ai["model"] is None or isinstance(ai["model"], str)
+    assert isinstance(ai["summary"], str)
+    assert is_str_list(ai["limitations"]) and is_str_list(ai["next_steps"]) and is_str_list(ai["warnings"])
+    evidence = ai["finding_evidence"]
+    assert isinstance(evidence, dict) and all(isinstance(v, str) for v in evidence.values())
+    assert set(evidence) == finding_ids
+    assert ai["patch_status"] in ("none", "proposed_not_validated", "proposed_failed_static_review")
+    assert (ai["patch_status"] == "none") == (result["patch"]["patched_dockerfile"] == "")
+
+    if result["status"] == "completed":
+        assert ai["error"] is None
+        review = ai["patch_review"]
+        assert set(review) == {"type", "passed", "issues", "note"}
+        assert review["type"] == "static" and isinstance(review["passed"], bool)
+        assert isinstance(review["note"], str)
+        assert all(set(i) == {"code", "message"} and isinstance(i["code"], str) and isinstance(i["message"], str)
+                   for i in review["issues"])
+        if ai["patch_status"] != "none":
+            expected = "proposed_not_validated" if review["passed"] else "proposed_failed_static_review"
+            assert ai["patch_status"] == expected
+    else:
+        assert set(ai["error"]) == {"code", "message"}
+        assert isinstance(ai["error"]["code"], str) and ai["error"]["code"]
+        assert isinstance(ai["error"]["message"], str) and ai["error"]["message"]
+        assert "patch_review" not in ai and "usage" not in ai
+        assert result["findings"] == [] and result["correlations"] == []
+        assert result["patch"] == {"patched_dockerfile": "", "diff": "", "summary": ""}
+
+    if "usage" in ai:
+        assert result["status"] == "completed" and ai["source"] == "nebius"
+        usage = ai["usage"]
+        assert usage and set(usage) <= USAGE_KEYS
+        assert all(type(v) is int and v >= 0 for v in usage.values())
+
+
+MOCK =dataclasses.replace(SETTINGS, mode="mock", api_key="")
 
 
 def test_mock_insecure_dockerfile_with_logs():
@@ -330,6 +384,276 @@ def test_live_malformed_model_output(fake_net):
 
 def test_empty_dockerfile():
     assert analyze_evidence("  ", None, settings=MOCK)["status"] == "ai_error"
+
+
+# ---------------- truncated replies (finish_reason == "length") ----------------
+
+GOOD_JSON_TEXT = json.dumps(GOOD_MODEL_JSON)
+TRUNCATED_CONTENTS = {
+    "valid_json": GOOD_JSON_TEXT,
+    "json_then_cut_text": GOOD_JSON_TEXT + " and then the model kept wri",
+    "plain_text": "The Dockerfile has several problems. The first one is",
+    "unclosed_think_with_json": "<think>For example " + GOOD_JSON_TEXT + ' now the real answer {"fin',
+}
+
+
+@pytest.mark.parametrize("content", list(TRUNCATED_CONTENTS.values()), ids=list(TRUNCATED_CONTENTS))
+def test_client_rejects_truncated_reply_without_retry(fake_net, content):
+    outcomes, calls = fake_net
+    outcomes.append(chat_body(content, finish_reason="length"))
+    with pytest.raises(AIIntegrationError) as exc:
+        client().chat("sys", "user")
+    assert exc.value.code == "invalid_response" and "cut off" in str(exc.value)
+    assert len(calls) == 1  # truncated replies are not retried
+    assert FAKE_KEY not in str(exc.value)
+
+
+def test_truncated_reply_after_json_mode_fallback_is_rejected(fake_net):
+    outcomes, calls = fake_net
+    outcomes += [http_error(400), chat_body(GOOD_JSON_TEXT, finish_reason="length")]
+    with pytest.raises(AIIntegrationError) as exc:
+        client().chat("sys", "user")
+    assert exc.value.code == "invalid_response"
+    assert len(calls) == 2 and "response_format" not in calls[1]["body"]
+
+
+@pytest.mark.parametrize("finish_reason", ["stop", None])
+def test_complete_reply_is_accepted(fake_net, finish_reason):
+    outcomes, calls = fake_net
+    outcomes.append(chat_body(GOOD_JSON_TEXT, finish_reason=finish_reason))
+    reply = client().chat("sys", "user")
+    assert json.loads(reply["content"]) == GOOD_MODEL_JSON
+    assert reply["finish_reason"] == finish_reason and len(calls) == 1
+
+
+def test_complete_reply_after_json_mode_fallback_is_accepted(fake_net):
+    outcomes, calls = fake_net
+    outcomes += [http_error(400), chat_body(GOOD_JSON_TEXT, finish_reason="stop")]
+    assert json.loads(client().chat("sys", "user")["content"]) == GOOD_MODEL_JSON
+    assert len(calls) == 2
+
+
+def test_service_returns_ai_error_for_truncated_reply(fake_net):
+    outcomes, calls = fake_net
+    outcomes.append(chat_body(GOOD_JSON_TEXT, finish_reason="length"))
+    result = analyze_evidence("FROM python:3.11\n", None, settings=SETTINGS, client=client())
+    assert_contract(result)
+    assert result["status"] == "ai_error" and result["ai"]["error"]["code"] == "invalid_response"
+    assert result["ai"]["source"] == "nebius"  # never falls back to mock
+    assert len(calls) == 1
+    assert FAKE_KEY not in json.dumps(result)
+
+
+def test_analyze_with_nebius_rejects_truncated_reply(fake_net, monkeypatch):
+    outcomes, _ = fake_net
+    monkeypatch.setattr(nc, "get_settings", lambda: SETTINGS)
+    outcomes.append(chat_body(GOOD_JSON_TEXT, finish_reason="length"))
+    with pytest.raises(AIIntegrationError) as exc:
+        nc.analyze_with_nebius("prompt")
+    assert exc.value.code == "invalid_response"
+
+
+class InjectedClient:
+    """Stand-in for a custom client passed to analyze_evidence (no NebiusClient checks)."""
+
+    def __init__(self, content=GOOD_JSON_TEXT, finish_reason="stop", usage=None):
+        self.reply = {"content": content, "model": "custom/model", "usage": usage or {},
+                      "finish_reason": finish_reason}
+
+    def chat(self, system_prompt, user_prompt):
+        return dict(self.reply)
+
+
+def test_service_rejects_truncated_reply_from_injected_client():
+    result = analyze_evidence("FROM python:3.11\n", None, settings=SETTINGS,
+                              client=InjectedClient(finish_reason="length"))
+    assert_contract(result)
+    assert result["status"] == "ai_error" and result["ai"]["error"]["code"] == "invalid_response"
+
+
+@pytest.mark.parametrize("finish_reason", ["stop", None])
+def test_service_accepts_complete_reply_from_injected_client(finish_reason):
+    result = analyze_evidence("FROM python:3.11\n", None, settings=SETTINGS,
+                              client=InjectedClient(finish_reason=finish_reason))
+    assert_contract(result)
+    assert result["status"] == "completed" and len(result["findings"]) == 1
+
+
+# ---------------- usage and finding id hygiene ----------------
+
+def test_usage_keeps_only_non_negative_integer_counts():
+    usage = {"prompt_tokens": 10, "completion_tokens": "5", "total_tokens": True, "cost": 3}
+    result = analyze_evidence("FROM python:3.11\n", None, settings=SETTINGS, client=InjectedClient(usage=usage))
+    assert_contract(result)
+    assert result["ai"]["usage"] == {"prompt_tokens": 10}
+
+
+def test_usage_omitted_when_no_valid_counts():
+    usage = {"prompt_tokens": -1, "total_tokens": None}
+    result = analyze_evidence("FROM python:3.11\n", None, settings=SETTINGS, client=InjectedClient(usage=usage))
+    assert_contract(result)
+    assert "usage" not in result["ai"]
+
+
+def analyze_reply(reply):
+    """Run a model reply through the full service (with logs, so correlations are grounded)."""
+    result = analyze_evidence("FROM python:3.11\n", [], settings=SETTINGS,
+                              client=InjectedClient(content=json.dumps(reply)))
+    assert_contract(result)  # agreed schema, unique ids, valid references
+    titles = {f["id"]: f["title"] for f in result["findings"]}
+    linked = [[titles[i] for i in c["related_finding_ids"]] for c in result["correlations"]]
+    return result, titles, linked
+
+
+def corr(*ids):
+    return {"related_finding_ids": list(ids), "explanation": "x"}
+
+
+def test_case_a_duplicate_does_not_steal_later_unique_id():
+    # F-001 is repeated; the later, unique F-002 must keep its id and its correlation.
+    result, titles, linked = analyze_reply({
+        "findings": [{"id": "F-001", "title": "a"}, {"id": "F-001", "title": "b"}, {"id": "F-002", "title": "d"}],
+        "correlations": [corr("F-002")]})
+    assert titles == {"F-001": "a", "F-003": "b", "F-002": "d"}
+    assert linked == [["d"]]
+    assert any("id 'F-001' is already used" in w and "renamed to 'F-003'" in w for w in result["ai"]["warnings"])
+    assert not any("'F-002'" in w for w in result["ai"]["warnings"])  # F-002 was never duplicated
+
+
+def test_case_b_reference_to_duplicated_id_is_dropped():
+    result, titles, linked = analyze_reply({
+        "findings": [{"id": "X", "title": "a"}, {"id": "X", "title": "b"}],
+        "correlations": [corr("X")]})
+    assert titles == {"X": "a", "F-001": "b"}
+    assert linked == [[]]  # dropped, not guessed
+    assert any("duplicated finding id(s) ['X']" in w for w in result["ai"]["warnings"])
+
+
+def test_case_c_missing_id_does_not_take_model_id():
+    result, titles, linked = analyze_reply({
+        "findings": [{"title": "a"}, {"id": "F-001", "title": "b"}],
+        "correlations": [corr("F-001")]})
+    assert titles == {"F-002": "a", "F-001": "b"}
+    assert linked == [["b"]]
+
+
+def test_case_d_ids_equal_after_truncation_are_ambiguous():
+    result, titles, linked = analyze_reply({
+        "findings": [{"id": "FINDING-ROOT-USER-0001", "title": "a"}, {"id": "FINDING-ROOT-USER-0002", "title": "b"}],
+        "correlations": [corr("FINDING-ROOT-USER-0002")]})
+    assert titles == {"FINDING-ROOT-USER-00": "a", "F-001": "b"}
+    assert linked == [[]]
+    assert any("duplicated finding id(s)" in w for w in result["ai"]["warnings"])
+
+
+def test_reference_never_resolves_to_a_generated_id():
+    # The model refers to F-002, which it never defined; the parser generates F-002 for "a".
+    result, titles, linked = analyze_reply({
+        "findings": [{"title": "a"}, {"id": "F-001", "title": "b"}],
+        "correlations": [corr("F-002", "F-001")]})
+    assert titles == {"F-002": "a", "F-001": "b"}
+    assert linked == [["b"]]
+    assert any("unknown finding ids" in w for w in result["ai"]["warnings"])
+
+
+def test_only_ambiguous_references_are_dropped():
+    result, titles, linked = analyze_reply({
+        "findings": [{"id": "X", "title": "a"}, {"id": "X", "title": "b"}, {"id": "Y", "title": "c"}],
+        "correlations": [corr("X", "Y", "Y")]})
+    assert linked == [["c"]]  # duplicate reference to Y also collapsed
+
+
+def test_duplicate_and_missing_ids_parser_level():
+    parsed = parse_model_response(json.dumps({"findings": [
+        {"id": "F-001", "title": "a", "evidence": "e1"},
+        {"id": "F-001", "title": "b", "evidence": "e2"},   # repeated id
+        {"title": "c", "evidence": "e3"},                  # missing id
+        {"id": "F-002", "title": "d", "evidence": "e4"},   # unique model id, must be kept
+    ]}))
+    assert [(f["id"], f["title"]) for f in parsed["findings"]] == [
+        ("F-001", "a"), ("F-003", "b"), ("F-004", "c"), ("F-002", "d")]
+    assert parsed["finding_evidence"] == {"F-001": "e1", "F-003": "e2", "F-004": "e3", "F-002": "e4"}
+    assert sum("is already used" in w for w in parsed["warnings"]) == 1
+
+
+# ---------------- full-id matching (review cases E1-E3) ----------------
+
+LONG_1, LONG_2 = "FINDING-ROOT-USER-0001", "FINDING-ROOT-USER-0002"  # equal in their first 20 characters
+
+
+def test_e1_reference_to_undefined_id_with_same_prefix_is_dropped():
+    result, titles, linked = analyze_reply({
+        "findings": [{"id": LONG_1, "title": "a"}],
+        "correlations": [corr(LONG_2), corr(LONG_1)]})
+    assert titles == {LONG_1[:20]: "a"}  # public id format unchanged
+    assert linked == [[], ["a"]]  # only the exact full id resolves
+    assert any("Correlation at index 0" in w and "unknown finding ids" in w for w in result["ai"]["warnings"])
+
+
+def test_e1_shortened_public_id_is_not_a_valid_reference():
+    _, _, linked = analyze_reply({
+        "findings": [{"id": LONG_1, "title": "a"}],
+        "correlations": [corr(LONG_1[:20])]})  # the model never saw the shortened form
+    assert linked == [[]]
+
+
+def test_e2_reference_to_dropped_finding_is_not_redirected():
+    result, titles, linked = analyze_reply({
+        "findings": [{"id": LONG_1, "title": "a"}, {"id": LONG_2, "title": ""}],  # second has no title
+        "correlations": [corr(LONG_2)]})
+    assert titles == {LONG_1[:20]: "a"}
+    assert linked == [[]]
+    assert any("malformed or beyond the first 50" in w for w in result["ai"]["warnings"])
+
+
+def test_e2_id_shared_with_dropped_finding_is_ambiguous():
+    result, _, linked = analyze_reply({
+        "findings": [{"id": "F-001", "title": ""}, {"id": "F-001", "title": "b"}],
+        "correlations": [corr("F-001")]})  # could mean the dropped one
+    assert linked == [[]]
+    assert any("duplicated finding id(s)" in w for w in result["ai"]["warnings"])
+
+
+def test_e3_reference_to_finding_beyond_cap_is_not_redirected():
+    findings = [{"id": f"G-{i}", "title": f"t{i}"} for i in range(50)]
+    findings[0]["id"] = "LATE-ROOT-USER-ID-XX-1"
+    findings.append({"id": "LATE-ROOT-USER-ID-XX-2", "title": "late"})  # index 50, beyond the cap
+    result, titles, linked = analyze_reply({"findings": findings,
+                                            "correlations": [corr("LATE-ROOT-USER-ID-XX-2")]})
+    assert len(titles) == 50 and "late" not in titles.values()
+    assert linked == [[]]
+    assert any("malformed or beyond the first 50" in w for w in result["ai"]["warnings"])
+
+
+# ---------------- malformed ids ----------------
+
+@pytest.mark.parametrize("bad_id", [["F-001", "F-002"], {"id": "F-001"}, 1.5, True, "F-001\nF-002", "x" * 201, "   "],
+                         ids=["list", "object", "float", "bool", "newline", "too_long", "blank"])
+def test_unusable_ids_get_new_ids_without_newlines(bad_id):
+    result, titles, linked = analyze_reply({
+        "findings": [{"id": bad_id, "title": "a"}, {"id": "F-001", "title": "b"}],
+        "correlations": [corr(bad_id if isinstance(bad_id, str) else "F-001")]})
+    assert titles == {"F-002": "a", "F-001": "b"}
+    assert all("\n" not in fid and len(fid) <= 20 for fid in titles)
+    assert any("unusable id" in w for w in result["ai"]["warnings"])
+    if isinstance(bad_id, str):
+        assert linked == [[]]  # a reference to an unusable id never resolves
+
+
+def test_integer_ids_and_references_match():
+    _, titles, linked = analyze_reply({
+        "findings": [{"id": 7, "title": "a"}],
+        "correlations": [corr(7), corr("7")]})
+    assert titles == {"7": "a"}
+    assert linked == [["a"], ["a"]]
+
+
+def test_non_list_findings_drop_all_references():
+    result = analyze_evidence("FROM python:3.11\n", [], settings=SETTINGS,
+                              client=InjectedClient(content=json.dumps({"findings": "oops",
+                                                                        "correlations": [corr("F-001")]})))
+    assert_contract(result)
+    assert result["findings"] == [] and result["correlations"][0]["related_finding_ids"] == []
 
 
 # ---------------- optional live test ----------------
