@@ -1,0 +1,8 @@
+# Harmless, intentionally weak example for testing. Never deploy.
+FROM python:latest
+ENV DB_PASSWORD=example-not-a-real-password
+WORKDIR /app
+COPY . /app
+RUN chmod -R 777 /app
+EXPOSE 22 8000
+CMD ["python", "app.py"]

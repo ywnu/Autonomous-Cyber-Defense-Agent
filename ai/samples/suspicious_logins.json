@@ -1,0 +1,9 @@
+{
+  "note": "Synthetic logs for testing. IPs are from documentation ranges (RFC 5737).",
+  "events": [
+    {"timestamp": "2026-10-26T02:14:01Z", "type": "suspicious_login", "source_ip": "203.0.113.45", "port": 22, "user": "root", "result": "failed"},
+    {"timestamp": "2026-10-26T02:14:03Z", "type": "suspicious_login", "source_ip": "203.0.113.45", "port": 22, "user": "admin", "result": "failed"},
+    {"timestamp": "2026-10-26T02:14:05Z", "type": "suspicious_login", "source_ip": "203.0.113.45", "port": 22, "user": "ubuntu", "result": "failed"},
+    {"timestamp": "2026-10-26T02:15:10Z", "type": "port_scan", "source_ip": "198.51.100.7", "ports": [21, 22, 80, 443, 8000]}
+  ]
+}
