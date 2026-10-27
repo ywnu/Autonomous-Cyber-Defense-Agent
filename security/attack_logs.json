@@ -1,0 +1,28 @@
+[
+  {
+    "timestamp": "2026-10-25T10:14:02Z",
+    "source_ip": "198.51.100.45",
+    "event_type": "PORT_SCAN",
+    "target_port": 22,
+    "status": "DETECTED",
+    "details": "SYN scan detected targeting exposed SSH daemon on container."
+  },
+  {
+    "timestamp": "2026-10-25T10:14:15Z",
+    "source_ip": "198.51.100.45",
+    "event_type": "AUTH_ATTEMPT",
+    "target_port": 22,
+    "user": "root",
+    "status": "FAILED",
+    "details": "Repeated unauthorized SSH login attempts (brute-force pattern)."
+  },
+  {
+    "timestamp": "2026-10-25T10:15:00Z",
+    "source_ip": "198.51.100.45",
+    "event_type": "EXPLOITATION_ATTEMPT",
+    "target_port": 5000,
+    "payload": "/api/debug?env=true",
+    "status": "FLAGGED",
+    "details": "Attempt to dump environment variables to extract AWS_SECRET_KEY."
+  }
+]

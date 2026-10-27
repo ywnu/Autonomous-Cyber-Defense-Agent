@@ -1,13 +1,17 @@
 import json
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
+
 from backend.simulation import simulate_response
 from backend.validator import validate_dockerfile
+from backend.attack_monitor import router as attack_monitor_router
 
 app = FastAPI(
     title="Autonomous Cyber Defense Agent",
     version="0.1.0"
 )
+
+app.include_router(attack_monitor_router)
 
 MAX_FILE_SIZE = 1024 * 1024  # 1 MB
 
@@ -23,14 +27,12 @@ async def analyze(
     attack_logs: UploadFile | None = File(None)
 ):
 
-    # 1. Validate Dockerfile filename
     if dockerfile.filename != "Dockerfile":
         raise HTTPException(
             status_code=400,
             detail="File must be named Dockerfile"
         )
 
-    # 2. Read Dockerfile with size limit
     docker_content = await dockerfile.read(MAX_FILE_SIZE + 1)
 
     if len(docker_content) > MAX_FILE_SIZE:
@@ -45,7 +47,6 @@ async def analyze(
             detail="Dockerfile is empty"
         )
 
-    # 3. Validate text encoding
     try:
         docker_text = docker_content.decode("utf-8")
     except UnicodeDecodeError:
@@ -54,7 +55,6 @@ async def analyze(
             detail="Dockerfile must be UTF-8 text"
         )
 
-    # 4. Validate optional JSON attack logs
     logs = None
 
     if attack_logs is not None:
@@ -87,13 +87,10 @@ async def analyze(
                 detail="Attack logs must contain an object or array"
             )
 
-    # 5. Security response simulation
     simulation_result = simulate_response(logs)
 
-    # 6. Dockerfile security validation
     validation_result = validate_dockerfile(docker_text)
 
-    # 7. Temporary response until AI integration
     return {
         "status": "completed",
         "findings": [],
