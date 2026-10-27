@@ -3,25 +3,56 @@
   "findings": [
     {
       "id": "F-001",
-      "issue": "Container runs as root",
+      "title": "Container runs as root",
       "severity": "HIGH",
-      "description": "No non-root USER configured",
-      "evidence": "Dockerfile",
-      "recommendation": "Use a non-root user"
+      "description": "Illustrative example. No USER instruction, so the container runs as root.",
+      "recommendation": "Create a non-root user and switch to it with USER."
     }
   ],
-  "correlations": [],
+  "correlations": [
+    {
+      "event_type": "AUTH_ATTEMPT",
+      "source_ip": "192.0.2.10",
+      "related_finding_ids": ["F-001"],
+      "explanation": "Illustrative example. event_type and source_ip are copied from the uploaded logs, or null if absent. 192.0.2.10 is a documentation address (RFC 5737)."
+    }
+  ],
   "patch": {
-    "patched_dockerfile": "",
-    "diff": ""
+    "patched_dockerfile": "FROM python:3.11-slim\nRUN useradd --create-home appuser\nUSER appuser\n",
+    "diff": "--- Dockerfile\n+++ Dockerfile.proposed\n@@ -1 +1,3 @@\n FROM python:3.11-slim\n+RUN useradd --create-home appuser\n+USER appuser\n",
+    "summary": "Adds a non-root user and switches to it."
   },
   "tests": {
-    "status": "not_run",
-    "passed": null,
-    "details": []
+    "status": "completed",
+    "passed": false,
+    "details": ["Missing non-root USER instruction"],
+    "proposed_patch": {
+      "status": "static_review_only",
+      "passed": true,
+      "details": []
+    }
   },
   "response": {
     "mode": "simulation",
     "actions": []
+  },
+  "ai": {
+    "source": "mock",
+    "model": "mock-rule-based",
+    "summary": "Illustrative example. 1 finding, 1 correlation.",
+    "limitations": ["Static analysis of the uploaded text; nothing was built or run."],
+    "next_steps": ["Review the proposed patch, then build and test it in an isolated environment."],
+    "warnings": [],
+    "finding_evidence": {
+      "F-001": "No USER instruction in the Dockerfile"
+    },
+    "patch_status": "proposed_not_validated",
+    "patch_review": {
+      "type": "static",
+      "passed": true,
+      "issues": [],
+      "note": "Static text checks only. No image was built and no container was run."
+    },
+    "error": null
   }
 }

@@ -12,14 +12,20 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_BASE_URL = "https://api.tokenfactory.nebius.com/v1"
+DEFAULT_MAX_OUTPUT_TOKENS = 16384
 VALID_MODES = ("mock", "live")
 VALID_JSON_MODES = ("json_object", "none")
 
 
 def load_dotenv(path: Path = REPO_ROOT / ".env") -> None:
-    """Minimal .env loader (KEY=VALUE lines). Does not override existing env vars."""
+    """
+    Minimal .env loader (KEY=VALUE lines). Does not override existing env vars.
+    If a key appears more than once in the file, the last value wins (as in
+    common dotenv tools), so editing a later duplicate line takes effect.
+    """
     if not path.is_file():
         return
+    values: dict[str, str] = {}
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -31,7 +37,10 @@ def load_dotenv(path: Path = REPO_ROOT / ".env") -> None:
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
-        if key and key not in os.environ:
+        if key:
+            values[key] = value
+    for key, value in values.items():
+        if key not in os.environ:
             os.environ[key] = value
 
 
@@ -86,6 +95,7 @@ def get_settings() -> Settings:
         model=(os.getenv("NEBIUS_MODEL") or "").strip(),
         timeout_seconds=_float_env("NEBIUS_TIMEOUT_SECONDS", 60.0, 5.0, 300.0),
         max_retries=_int_env("NEBIUS_MAX_RETRIES", 2, 0, 5),
-        max_output_tokens=_int_env("NEBIUS_MAX_OUTPUT_TOKENS", 4096, 256, 32768),
+        # 4096 was too small for the Nemotron reasoning model: replies were cut off and rejected.
+        max_output_tokens=_int_env("NEBIUS_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS, 256, 32768),
         json_mode=json_mode,
     )

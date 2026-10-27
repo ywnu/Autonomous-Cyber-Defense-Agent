@@ -30,7 +30,11 @@ from ai.mock import MOCK_MODEL_NAME, mock_model_reply
 from ai.nebius_client import AIIntegrationError, NebiusClient
 from ai.patch_review import SECRET_KEY_RE, _instructions, review_patch
 from ai.prompts import SYSTEM_PROMPT, build_user_prompt
-from ai.response_parser import _extract_json_object, normalize_patch_line_breaks, parse_model_response
+from ai.response_parser import (
+    _extract_json_object,
+    normalize_patch_line_breaks,
+    parse_model_response,
+)
 
 
 def _unified_diff(original: str, patched: str) -> str:
