@@ -5,11 +5,14 @@ from starlette.concurrency import run_in_threadpool
 from backend.simulation import simulate_response
 from backend.validator import validate_dockerfile
 from ai.service import analyze_evidence
+from backend.attack_monitor import router as attack_monitor_router
 
 app = FastAPI(
     title="Autonomous Cyber Defense Agent",
     version="0.1.0"
 )
+
+app.include_router(attack_monitor_router)
 
 MAX_FILE_SIZE = 1024 * 1024  # 1 MB
 
