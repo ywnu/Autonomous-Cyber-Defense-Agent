@@ -16,6 +16,8 @@ from collections import Counter
 from contextvars import ContextVar
 from typing import Any, Iterable, Optional
 
+from ai.patch_review import ESCAPED_INSTRUCTION_BREAK_RE
+
 SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
 SEVERITY_ALIASES = {"MODERATE": "MEDIUM", "INFORMATIONAL": "INFO", "NONE": "INFO", "WARNING": "MEDIUM"}
 MAX_FINDINGS = 50
@@ -272,6 +274,26 @@ def _parse_correlations(items: Any, warnings: list[str], ref_index: dict) -> lis
     return result
 
 
+_TRAILING_ESCAPED_BREAKS_RE = re.compile(r"(?:(?:\\r)?\\n)+\s*$")
+
+
+def normalize_patch_line_breaks(text: str) -> str:
+    """
+    Some models return the patched Dockerfile with its line breaks escaped
+    (the text "\\n" instead of a real newline), so the whole file is one line.
+    Fix that, but only when it is unambiguous:
+      - the text has no real line break (apart from surrounding whitespace), and
+      - only a literal "\\n" directly before a Dockerfile instruction, or at the
+        very end, is converted. Any other "\\n" (e.g. inside RUN printf "a\\nb")
+        is kept as written.
+    Text that already has real line breaks is returned unchanged.
+    """
+    if not isinstance(text, str) or "\n" in text.strip() or not ESCAPED_INSTRUCTION_BREAK_RE.search(text):
+        return text
+    fixed = ESCAPED_INSTRUCTION_BREAK_RE.sub("\n", text)
+    return _TRAILING_ESCAPED_BREAKS_RE.sub("\n", fixed)
+
+
 def _parse_patch(value: Any, warnings: list[str]) -> dict:
     empty = {"patched_dockerfile": "", "diff": "", "summary": ""}
     if value is None:
@@ -285,6 +307,12 @@ def _parse_patch(value: Any, warnings: list[str]) -> dict:
         if raw is not None and not isinstance(raw, str):
             warnings.append(f"'patch.{field}' was not a string; treated as empty.")
             raw = ""
+        if field == "patched_dockerfile" and raw:
+            fixed = normalize_patch_line_breaks(raw)
+            if fixed != raw:
+                warnings.append("'patch.patched_dockerfile' used literal '\\n' sequences instead of "
+                                "line breaks; they were converted to real line breaks.")
+                raw = fixed
         patch[field] = _cut((raw or "").strip(), limit) if field == "summary" else _cut(raw or "", limit)
     return patch
 

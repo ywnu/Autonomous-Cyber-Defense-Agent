@@ -30,7 +30,7 @@ from ai.mock import MOCK_MODEL_NAME, mock_model_reply
 from ai.nebius_client import AIIntegrationError, NebiusClient
 from ai.patch_review import SECRET_KEY_RE, _instructions, review_patch
 from ai.prompts import SYSTEM_PROMPT, build_user_prompt
-from ai.response_parser import _extract_json_object, parse_model_response
+from ai.response_parser import _extract_json_object, normalize_patch_line_breaks, parse_model_response
 
 
 def _unified_diff(original: str, patched: str) -> str:
@@ -154,7 +154,9 @@ def _full_patch_text(raw: Any) -> str:
         return ""
     patch = data.get("patch") if isinstance(data, dict) else None
     value = patch.get("patched_dockerfile") if isinstance(patch, dict) else None
-    return value if isinstance(value, str) else ""
+    # Same line-break normalization as the parser, so secrets on "lines" that the
+    # model joined with literal "\n" are still found before any length limit.
+    return normalize_patch_line_breaks(value) if isinstance(value, str) else ""
 
 
 def _redact(value: Any, secrets: list[str]) -> Any:
