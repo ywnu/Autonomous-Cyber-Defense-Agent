@@ -23,6 +23,7 @@ The backend is implemented with **FastAPI** and connects the security scenario, 
 |---|---|---|
 | `GET` | `/api/health` | Returns `{"status":"ok"}`. |
 | `POST` | `/api/analyze` | Analyzes the uploaded Dockerfile and optional attack logs. |
+| `GET` | `/api/attack-events` | Returns the demo attack logs from `security/attack_logs.json` (`mode: "simulation"`). |
 
 ### `POST /api/analyze` request
 
@@ -39,7 +40,7 @@ curl.exe -sS -X POST "http://127.0.0.1:8000/api/analyze" `
   -F "attack_logs=@security/attack_logs.json;type=application/json"
 ```
 
-The response includes `status`, `findings`, `correlations`, `patch`, `tests`, `response`, and `ai` metadata. The `ai.source` field distinguishes real Nebius calls (`nebius`) from offline mock runs (`mock`). The `patch.diff` field is computed locally rather than trusted from the model.
+The response includes `status`, `findings`, `correlations`, `patch`, `tests`, `response`, and `ai` metadata. The `ai.source` field shows the configured mode (`nebius` or `mock`); it is `nebius` even when the live call failed, so a genuine model answer is `status: "completed"` with `ai.source: "nebius"`. The `patch.diff` field is computed locally rather than trusted from the model.
 
 ## Validation and safety boundaries
 
@@ -70,6 +71,8 @@ From the repository root, install the project's dependencies and configure AI se
 ```powershell
 py -m uvicorn backend.main:app --reload
 ```
+
+Run the tests with `AI_MODE=mock` (see the root `README.md`): some tests in `test_main.py` call `/api/analyze` without faking the AI, so a `.env` set to `live` would make real Nebius calls.
 
 Run backend tests:
 

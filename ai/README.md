@@ -47,14 +47,14 @@ AI_MODE=mock
 
 Set `AI_MODE=live` to use the real Nebius model. Keep `.env` out of version control. Never paste API keys into source code, logs, or documentation.
 
-To check the configured Nebius connection:
+To check the configured Nebius connection (`--chat` sends one small request and uses a few tokens):
 
 ```powershell
 py -m ai.check_connection
 py -m ai.check_connection --chat
 ```
 
-To run a mock or live demo:
+To run a mock or live demo (`--mode live` calls Nebius and uses credits):
 
 ```powershell
 py -m ai.demo --mode mock
@@ -80,7 +80,7 @@ The returned object includes:
 - `patch`: `patched_dockerfile`, locally computed `diff`, and `summary`.
 - `tests`: initially `not_run`; populated by the **backend**, not the AI.
 - `response`: simulated response actions populated by the **backend**, not the AI.
-- `ai`: source (`nebius` or `mock`), model, warnings, limitations, patch review, and error metadata.
+- `ai`: source (`nebius` or `mock`), model, warnings, limitations, patch review, and error metadata. `source` reflects the configured mode and is `nebius` even when the live call failed; a genuine model answer is `status: "completed"` with `source: "nebius"`.
 
 The agreed `findings`, `correlations`, and `patch` fields match the current backend integration contract. Model output is never executed as code.
 
