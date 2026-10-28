@@ -17,7 +17,9 @@ the application's required functionality.
 2. ATTACK SURFACE REDUCTION
 - Remove unnecessary services such as openssh-server.
 - Remove EXPOSE 22 if SSH is not required.
-- Preserve the application's required port 5000.
+- Preserve the application's required ports based on the original Dockerfile.
+- For the hackathon example that declares EXPOSE 5000, preserve EXPOSE 5000.
+- Do not add port 5000 to unrelated applications unless required.
 - Do not assume EXPOSE alone publishes a port externally.
 
 3. SECRET PROTECTION

@@ -80,6 +80,22 @@ security_policy:
         - Do not remove essential application components
         - Do not claim success before validation
 
+    - id: SEC-005
+      name: "Debug Mode Enabled"
+      severity: MEDIUM
+
+      detection:
+        - Check whether debug or development mode is enabled
+        - Detect DEBUG or DEBUG_MODE explicitly set to true
+
+      remediation:
+        - Disable debug mode in production
+        - Preserve required application functionality
+
+      constraints:
+        - Do not assume a debug endpoint exists without evidence
+        - Do not claim sensitive information was leaked without evidence
+
   reasoning:
     - Use observable evidence only
     - Correlate logs using IP, timestamp, port, and event type

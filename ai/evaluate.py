@@ -648,6 +648,39 @@ def run_pipeline(mode):
     return service_result_to_model_output(result)
 
 
+
+def strict_quality_issues(actual, expected):
+    """Preliminary quality gate; does not verify real-world security."""
+    issues = []
+
+    if is_legacy_format(actual):
+        issues.append(
+            "Legacy output format cannot pass the current strict schema."
+        )
+        return issues
+
+    missing = validate_output(actual)
+    if missing:
+        issues.append("Missing required fields: " + ", ".join(missing))
+
+    for error in schema_errors(actual):
+        issues.append("Schema violation: " + error)
+
+    _, missed = evaluate_findings(actual, expected)
+    for finding in missed:
+        issues.append(
+            "Expected finding missing: " + finding["title"]
+        )
+
+    for issue in evaluate_patch(actual.get("patch")):
+        issues.append("Patch check failed: " + issue)
+
+    for issue in check_unsupported_claims(actual):
+        issues.append("Unsupported claim: " + issue)
+
+    return issues
+
+
 def main():
     import argparse
 
@@ -660,6 +693,11 @@ def main():
         "--run", choices=["mock", "live"],
         help="run the analysis pipeline on test_cases/ and evaluate its output "
              "instead of reading a saved file (live uses the Nebius API)"
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return a nonzero exit code when preliminary quality checks fail",
     )
     args = parser.parse_args()
 
@@ -759,6 +797,16 @@ def main():
     evaluate_vulnerability_correlation(actual)
     evaluate_terraform()
     print("\n===== EVALUATION COMPLETE =====")
+
+    if args.strict:
+        issues = strict_quality_issues(actual, expected)
+        if issues:
+            print("\n[STRICT] FAILED:")
+            for issue in issues:
+                print(f"  - {issue}")
+            return 1
+        print("\n[STRICT] PASSED: preliminary quality checks")
+
     return 0
 
 

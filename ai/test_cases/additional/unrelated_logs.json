@@ -1,0 +1,8 @@
+[
+  {
+    "event_type": "PORT_SCAN",
+    "source_ip": "198.51.100.20",
+    "target_port": 443,
+    "status": "blocked"
+  }
+]
